@@ -1,40 +1,27 @@
 #!/usr/bin/env python3
-"""Fetch recent arXiv papers related to seed IDs and write a Markdown report."""
+"""Fetch recent arXiv papers and write an AI-readable analysis packet."""
 
 from __future__ import annotations
 
 import argparse
 import datetime as dt
 import html
-import math
+import json
 import re
 import sys
 import time
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
-from collections import Counter
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any
 
 
-API_URL = "https://export.arxiv.org/api/query"
+ARXIV_API_URL = "https://export.arxiv.org/api/query"
 DEFAULT_CATEGORIES = ("hep-ex", "nucl-ex", "hep-ph", "nucl-th")
 ATOM = "{http://www.w3.org/2005/Atom}"
 ARXIV = "{http://arxiv.org/schemas/atom}"
-
-STOPWORDS = {
-    "about", "above", "after", "again", "against", "all", "also", "and", "any",
-    "are", "because", "been", "being", "between", "both", "can", "could",
-    "did", "does", "doing", "done", "due", "each", "for", "from", "had",
-    "has", "have", "having", "here", "how", "into", "its", "itself", "may",
-    "more", "most", "much", "not", "our", "out", "over", "same", "should",
-    "show", "shown", "such", "than", "that", "the", "their", "then", "there",
-    "these", "this", "those", "through", "under", "using", "was", "were",
-    "when", "where", "which", "while", "with", "within", "would",
-    "study", "studies", "paper", "results", "result", "analysis", "data",
-    "measurement", "measurements", "model", "models", "new", "using",
-}
 
 
 @dataclass(frozen=True)
@@ -53,15 +40,6 @@ class Paper:
     doi: str = ""
     journal_ref: str = ""
     comment: str = ""
-
-
-@dataclass(frozen=True)
-class ScoredPaper:
-    paper: Paper
-    score: float
-    matched_keywords: tuple[str, ...]
-    shared_authors: tuple[str, ...]
-    shared_categories: tuple[str, ...]
 
 
 def normalize_id(raw: str, keep_version: bool = False) -> str:
@@ -89,11 +67,11 @@ def parse_ymd(value: str) -> dt.date:
         raise argparse.ArgumentTypeError(f"Invalid date '{value}', expected YYYY-MM-DD") from exc
 
 
-def api_get(params: dict[str, str | int]) -> ET.Element:
+def arxiv_api_get(params: dict[str, str | int]) -> ET.Element:
     query = urllib.parse.urlencode(params)
     request = urllib.request.Request(
-        f"{API_URL}?{query}",
-        headers={"User-Agent": "codex-arxiv-weekly-related-papers/1.0"},
+        f"{ARXIV_API_URL}?{query}",
+        headers={"User-Agent": "codex-arxiv-weekly-related-papers/3.0"},
     )
     with urllib.request.urlopen(request, timeout=45) as response:
         payload = response.read()
@@ -127,9 +105,6 @@ def parse_paper(entry: ET.Element) -> Paper:
         for author in entry.findall(f"{ATOM}author")
         if text_of(author.find(f"{ATOM}name"))
     )
-    doi = text_of(entry.find(f"{ARXIV}doi"))
-    journal_ref = text_of(entry.find(f"{ARXIV}journal_ref"))
-    comment = text_of(entry.find(f"{ARXIV}comment"))
     return Paper(
         arxiv_id=arxiv_id,
         versioned_id=versioned_id,
@@ -142,9 +117,9 @@ def parse_paper(entry: ET.Element) -> Paper:
         categories=categories,
         abs_url=abs_url or f"https://arxiv.org/abs/{arxiv_id}",
         pdf_url=pdf_url or f"https://arxiv.org/pdf/{arxiv_id}",
-        doi=doi,
-        journal_ref=journal_ref,
-        comment=comment,
+        doi=text_of(entry.find(f"{ARXIV}doi")),
+        journal_ref=text_of(entry.find(f"{ARXIV}journal_ref")),
+        comment=text_of(entry.find(f"{ARXIV}comment")),
     )
 
 
@@ -154,7 +129,7 @@ def entries_from_feed(feed: ET.Element) -> list[Paper]:
 
 def fetch_seed_papers(ids: list[str]) -> list[Paper]:
     versioned = [normalize_id(item, keep_version=True) for item in ids]
-    feed = api_get({"id_list": ",".join(versioned), "max_results": len(versioned)})
+    feed = arxiv_api_get({"id_list": ",".join(versioned), "max_results": len(versioned)})
     papers = entries_from_feed(feed)
     found = {paper.arxiv_id for paper in papers}
     missing = [normalize_id(item) for item in ids if normalize_id(item) not in found]
@@ -169,116 +144,64 @@ def date_query(start_date: dt.date, end_date: dt.date) -> str:
     return f"submittedDate:[{start} TO {end}]"
 
 
+def paper_window_date(paper: Paper, date_field: str) -> dt.date | None:
+    value = paper.updated if date_field == "lastUpdatedDate" else paper.published
+    if not value:
+        return None
+    try:
+        return dt.date.fromisoformat(value[:10])
+    except ValueError:
+        return None
+
+
 def fetch_recent_candidates(
     categories: list[str],
     start_date: dt.date,
     end_date: dt.date,
+    date_field: str,
     max_candidates: int,
     page_size: int,
 ) -> list[Paper]:
     category_query = " OR ".join(f"cat:{category}" for category in categories)
-    search_query = f"({category_query}) AND {date_query(start_date, end_date)}"
+    search_query = f"({category_query})"
+    if date_field == "submittedDate":
+        search_query = f"{search_query} AND {date_query(start_date, end_date)}"
+
     papers: list[Paper] = []
     seen: set[str] = set()
     for start in range(0, max_candidates, page_size):
         limit = min(page_size, max_candidates - start)
-        feed = api_get(
+        feed = arxiv_api_get(
             {
                 "search_query": search_query,
                 "start": start,
                 "max_results": limit,
-                "sortBy": "submittedDate",
+                "sortBy": date_field,
                 "sortOrder": "descending",
             }
         )
         page = entries_from_feed(feed)
         if not page:
             break
+        saw_older_update = False
         for paper in page:
-            if paper.arxiv_id not in seen:
+            window_date = paper_window_date(paper, date_field)
+            if window_date is None:
+                continue
+            if date_field == "lastUpdatedDate" and window_date < start_date:
+                saw_older_update = True
+                continue
+            if start_date <= window_date <= end_date and paper.arxiv_id not in seen:
                 papers.append(paper)
                 seen.add(paper.arxiv_id)
+                if len(papers) >= max_candidates:
+                    return papers
         if len(page) < limit:
+            break
+        if date_field == "lastUpdatedDate" and saw_older_update:
             break
         time.sleep(3.0)
     return papers
-
-
-def tokenize(text: str) -> list[str]:
-    tokens = re.findall(r"[a-zA-Z][a-zA-Z0-9+\-]{2,}", text.lower())
-    normalized = [token.strip("-") for token in tokens]
-    return [token for token in normalized if len(token) >= 3 and token not in STOPWORDS]
-
-
-def author_key(name: str) -> str:
-    parts = re.findall(r"[A-Za-z]+", name.lower())
-    if not parts:
-        return ""
-    return parts[-1]
-
-
-def seed_profile(seed_papers: list[Paper]) -> tuple[Counter[str], set[str], set[str]]:
-    weighted_terms: Counter[str] = Counter()
-    authors: set[str] = set()
-    categories: set[str] = set()
-    for paper in seed_papers:
-        weighted_terms.update({token: 4 for token in tokenize(paper.title)})
-        weighted_terms.update(tokenize(paper.summary))
-        authors.update(key for key in (author_key(author) for author in paper.authors) if key)
-        categories.update(paper.categories)
-        if paper.primary_category:
-            categories.add(paper.primary_category)
-    return weighted_terms, authors, categories
-
-
-def score_candidate(paper: Paper, terms: Counter[str], seed_authors: set[str], seed_categories: set[str]) -> ScoredPaper:
-    candidate_title = set(tokenize(paper.title))
-    candidate_summary = set(tokenize(paper.summary))
-    candidate_terms = candidate_title | candidate_summary
-    top_seed_terms = {term for term, _ in terms.most_common(120)}
-    matched = sorted(top_seed_terms & candidate_terms, key=lambda term: (-terms[term], term))
-
-    title_hits = candidate_title & top_seed_terms
-    summary_hits = candidate_summary & top_seed_terms
-    category_hits = sorted(set(paper.categories) & seed_categories)
-    paper_authors = {key for key in (author_key(author) for author in paper.authors) if key}
-    author_hits = sorted(paper_authors & seed_authors)
-
-    keyword_score = sum(1.0 + math.log1p(terms[token]) for token in summary_hits)
-    title_score = sum(2.0 + math.log1p(terms[token]) for token in title_hits)
-    category_score = 1.5 * len(category_hits)
-    author_score = 2.0 * len(author_hits)
-    score = title_score + keyword_score + category_score + author_score
-
-    return ScoredPaper(
-        paper=paper,
-        score=round(score, 2),
-        matched_keywords=tuple(matched[:12]),
-        shared_authors=tuple(author_hits[:8]),
-        shared_categories=tuple(category_hits),
-    )
-
-
-def rank_candidates(
-    seeds: list[Paper],
-    candidates: list[Paper],
-    min_score: float,
-    top_n: int,
-) -> list[ScoredPaper]:
-    seed_ids = {paper.arxiv_id for paper in seeds}
-    terms, seed_authors, seed_categories = seed_profile(seeds)
-    scored = [
-        score_candidate(paper, terms, seed_authors, seed_categories)
-        for paper in candidates
-        if paper.arxiv_id not in seed_ids
-    ]
-    filtered = [item for item in scored if item.score >= min_score]
-    filtered.sort(key=lambda item: (-item.score, item.paper.published, item.paper.arxiv_id))
-    return filtered[:top_n]
-
-
-def md_escape(value: str) -> str:
-    return value.replace("|", "\\|").replace("\n", " ").strip()
 
 
 def short_authors(authors: tuple[str, ...], limit: int = 8) -> str:
@@ -287,67 +210,99 @@ def short_authors(authors: tuple[str, ...], limit: int = 8) -> str:
     return ", ".join(authors[:limit]) + f", et al. ({len(authors)} authors)"
 
 
-def first_paragraph(text: str, max_chars: int = 700) -> str:
-    clean = re.sub(r"\s+", " ", text).strip()
-    if len(clean) <= max_chars:
-        return clean
-    return clean[: max_chars - 1].rstrip() + "..."
+def chunked(items: list[Paper], size: int) -> list[list[Paper]]:
+    return [items[index : index + size] for index in range(0, len(items), size)]
 
 
-def labels(language: str) -> dict[str, str]:
-    if language == "en":
-        return {
-            "title": "arXiv Related Papers Report",
-            "params": "Query Parameters",
-            "seeds": "Seed Papers",
-            "related": "Ranked Related Papers",
-            "none": "No candidate papers met the score threshold.",
-            "method": "Methodology",
-            "abstract": "Abstract",
-            "score": "Score",
-            "keywords": "Matched keywords",
-            "shared_authors": "Shared author surnames",
-            "shared_categories": "Shared categories",
-            "links": "Links",
-        }
-    return {
-        "title": "arXiv 相关文献周报",
-        "params": "查询参数",
-        "seeds": "种子论文",
-        "related": "相关文献排序",
-        "none": "没有候选论文达到相关性分数阈值。",
-        "method": "方法说明",
-        "abstract": "摘要",
-        "score": "相关性分数",
-        "keywords": "匹配关键词",
-        "shared_authors": "共享作者姓氏",
-        "shared_categories": "共享分类",
-        "links": "链接",
-    }
+def paper_as_jsonable(paper: Paper) -> dict[str, Any]:
+    data = asdict(paper)
+    data["authors"] = list(paper.authors)
+    data["categories"] = list(paper.categories)
+    return data
 
 
-def write_report(
+def write_json_packet(
     output: Path,
+    *,
     seeds: list[Paper],
-    ranked: list[ScoredPaper],
+    candidates: list[Paper],
     categories: list[str],
     start_date: dt.date,
     end_date: dt.date,
-    args: argparse.Namespace,
+    date_field: str,
 ) -> None:
-    text = labels(args.language)
+    payload = {
+        "generated_utc": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "date_field": date_field,
+        "date_range": {
+            "start": start_date.isoformat(),
+            "end": end_date.isoformat(),
+            "timezone": "UTC",
+        },
+        "categories": categories,
+        "seed_papers": [paper_as_jsonable(paper) for paper in seeds],
+        "candidate_papers": [paper_as_jsonable(paper) for paper in candidates],
+        "analysis_schema": {
+            "relevance_score": "0-100 topical or methodological relatedness to the seed papers",
+            "recommendation_score": "0-100 how strongly the research group should read or track the paper",
+            "relation_type": "direct | method | background | contrast | weak | not_related",
+            "research_ideas": "Concrete follow-up directions or ways to connect the candidate paper with the seed-paper research",
+        },
+    }
+    output.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def write_markdown_packet(
+    output: Path,
+    *,
+    seeds: list[Paper],
+    candidates: list[Paper],
+    categories: list[str],
+    start_date: dt.date,
+    end_date: dt.date,
+    date_field: str,
+    batch_size: int,
+    language: str,
+) -> None:
     generated = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    lines: list[str] = [
-        f"# {text['title']}",
+    if language == "zh":
+        title = "arXiv 候选论文 AI 分析包"
+        instruction = (
+            "执行该 skill 的 Codex/opencode/Claude Code 应读取本文件，基于种子论文摘要分析每篇候选论文。"
+            "不要使用本地关键词/分类/作者重合打分；用当前模型判断相关程度、推荐程度，并为值得关注的论文给出拓展研究思路。"
+        )
+    else:
+        title = "arXiv Candidate Packet for AI Analysis"
+        instruction = (
+            "The Codex/opencode/Claude Code agent executing this skill should read this packet and analyze every candidate "
+            "against the seed-paper abstracts. Do not use local keyword/category/author-overlap scoring; use the current "
+            "model to judge relevance, recommendation strength, and extension ideas for useful papers."
+        )
+
+    lines = [
+        f"# {title}",
+        "",
+        instruction,
+        "",
+        "## Query",
         "",
         f"- Generated: {generated}",
+        f"- Date field: {date_field}",
         f"- Date range: {start_date.isoformat()} to {end_date.isoformat()} (UTC, inclusive)",
         f"- Categories: {', '.join(categories)}",
         f"- Seed IDs: {', '.join(paper.arxiv_id for paper in seeds)}",
-        f"- Candidates fetched: up to {args.max_candidates}",
-        f"- Minimum score: {args.min_score}",
+        f"- Candidate count: {len(candidates)}",
         "",
-        f"## {text['seeds']}",
+        "## Required AI Output Fields",
+        "",
+        "- `relevance_score`: 0-100",
+        "- `recommendation_score`: 0-100",
+        "- `relation_type`: direct | method | background | contrast | weak | not_related",
+        "- `relevance_reason`: concise reason grounded in the abstracts",
+        "- `recommendation_reason`: why the group should or should not track it",
+        "- `research_ideas`: concrete extension ideas or ways to combine with the seed-paper research",
+        "",
+        "## Seed Papers",
         "",
     ]
 
@@ -362,72 +317,58 @@ def write_report(
                 f"- Updated: {paper.updated[:10]}",
                 f"- PDF: {paper.pdf_url}",
                 "",
-                f"{first_paragraph(paper.summary)}",
+                paper.summary,
                 "",
             ]
         )
 
-    lines.extend([f"## {text['related']}", ""])
-    if not ranked:
-        lines.extend([text["none"], ""])
-    for index, item in enumerate(ranked, 1):
-        paper = item.paper
-        lines.extend(
-            [
-                f"### {index}. [{paper.arxiv_id}]({paper.abs_url}) {paper.title}",
-                "",
-                f"- {text['score']}: {item.score}",
-                f"- Authors: {short_authors(paper.authors)}",
-                f"- Categories: {', '.join(paper.categories)}",
-                f"- Published: {paper.published[:10]}",
-                f"- Updated: {paper.updated[:10]}",
-                f"- {text['keywords']}: {', '.join(item.matched_keywords) if item.matched_keywords else 'n/a'}",
-                f"- {text['shared_authors']}: {', '.join(item.shared_authors) if item.shared_authors else 'n/a'}",
-                f"- {text['shared_categories']}: {', '.join(item.shared_categories) if item.shared_categories else 'n/a'}",
-                f"- {text['links']}: [abs]({paper.abs_url}), [pdf]({paper.pdf_url})",
-                "",
-                f"**{text['abstract']}:** {first_paragraph(paper.summary)}",
-                "",
-            ]
-        )
-        if paper.comment:
-            lines.extend([f"- Comment: {md_escape(paper.comment)}", ""])
-        if paper.journal_ref:
-            lines.extend([f"- Journal ref: {md_escape(paper.journal_ref)}", ""])
-        if paper.doi:
-            lines.extend([f"- DOI: {md_escape(paper.doi)}", ""])
+    lines.extend(["## Candidate Papers", ""])
+    for batch_index, batch in enumerate(chunked(candidates, batch_size), 1):
+        lines.extend([f"### Batch {batch_index}", ""])
+        for paper in batch:
+            lines.extend(
+                [
+                    f"#### [{paper.arxiv_id}]({paper.abs_url}) {paper.title}",
+                    "",
+                    f"- Authors: {short_authors(paper.authors)}",
+                    f"- Categories: {', '.join(paper.categories)}",
+                    f"- Published: {paper.published[:10]}",
+                    f"- Updated: {paper.updated[:10]}",
+                    f"- PDF: {paper.pdf_url}",
+                    "",
+                    paper.summary,
+                    "",
+                ]
+            )
+            if paper.comment:
+                lines.extend([f"- Comment: {paper.comment}", ""])
+            if paper.journal_ref:
+                lines.extend([f"- Journal ref: {paper.journal_ref}", ""])
+            if paper.doi:
+                lines.extend([f"- DOI: {paper.doi}", ""])
 
-    methodology = (
-        "This report uses the public arXiv API. Recent papers are fetched by submittedDate "
-        "and category, then ranked with a heuristic score based on overlap with seed-paper "
-        "title terms, abstract terms, arXiv categories, and author surnames. arXiv does not "
-        "provide a native related-paper endpoint, so rankings are candidates for review rather "
-        "than exhaustive citation or semantic-similarity results."
-    )
-    if args.language == "zh":
-        methodology = (
-            "本报告使用公开 arXiv API。脚本先按 submittedDate 与分类抓取近期论文，"
-            "再根据种子论文标题词、摘要词、arXiv 分类和作者姓氏重合度进行启发式排序。"
-            "arXiv 不提供原生 related-paper 端点，因此结果是供人工复核的候选列表，"
-            "不是穷尽式引文检索或语义相似度检索。"
-        )
-    lines.extend([f"## {text['method']}", "", methodology, ""])
     output.write_text("\n".join(lines), encoding="utf-8")
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ids", nargs="+", required=True, help="Seed arXiv IDs, comma-separated or space-separated.")
-    parser.add_argument("--output", type=Path, help="Markdown output path.")
+    parser.add_argument("--packet-output", type=Path, help="Markdown packet path for the executing AI agent to read.")
+    parser.add_argument("--json-output", type=Path, help="Optional JSON packet path with the same papers and metadata.")
     parser.add_argument("--days", type=int, default=7, help="Lookback window in UTC days when explicit dates are absent.")
     parser.add_argument("--start-date", type=parse_ymd, help="Inclusive UTC start date, YYYY-MM-DD.")
     parser.add_argument("--end-date", type=parse_ymd, help="Inclusive UTC end date, YYYY-MM-DD.")
     parser.add_argument("--categories", default=",".join(DEFAULT_CATEGORIES), help="Comma-separated arXiv categories.")
+    parser.add_argument(
+        "--date-field",
+        choices=("lastUpdatedDate", "submittedDate"),
+        default="lastUpdatedDate",
+        help="arXiv date field used for the one-week window and sorting.",
+    )
     parser.add_argument("--max-candidates", type=int, default=1000, help="Maximum recent category papers to fetch.")
     parser.add_argument("--page-size", type=int, default=100, help="arXiv API page size.")
-    parser.add_argument("--top-n", type=int, default=50, help="Maximum related papers to include.")
-    parser.add_argument("--min-score", type=float, default=2.5, help="Minimum relatedness score.")
-    parser.add_argument("--language", choices=("zh", "en"), default="zh", help="Report label language.")
+    parser.add_argument("--batch-size", type=int, default=20, help="Number of candidate papers per Markdown batch.")
+    parser.add_argument("--language", choices=("zh", "en"), default="zh", help="Packet instruction language.")
     return parser.parse_args(argv)
 
 
@@ -445,6 +386,8 @@ def main(argv: list[str]) -> int:
         raise SystemExit("--max-candidates must be positive.")
     if args.page_size <= 0 or args.page_size > 2000:
         raise SystemExit("--page-size must be between 1 and 2000.")
+    if args.batch_size <= 0:
+        raise SystemExit("--batch-size must be positive.")
 
     today = dt.datetime.now(dt.timezone.utc).date()
     end_date = args.end_date or today
@@ -452,12 +395,13 @@ def main(argv: list[str]) -> int:
     if start_date > end_date:
         raise SystemExit("--start-date must be on or before --end-date.")
 
-    output = args.output or Path(f"arxiv_related_{end_date.isoformat()}.md")
+    packet_output = args.packet_output or Path(f"arxiv_candidate_packet_{end_date.isoformat()}.md")
+    json_output = args.json_output
 
     print(f"Fetching seed metadata for {len(seed_ids)} ID(s)...", file=sys.stderr)
     seeds = fetch_seed_papers(seed_ids)
     if not seeds:
-        raise SystemExit("No seed papers were found; cannot build a related-paper profile.")
+        raise SystemExit("No seed papers were found; cannot build an analysis packet.")
 
     print(
         f"Fetching recent candidates in {', '.join(categories)} from {start_date} to {end_date}...",
@@ -467,12 +411,39 @@ def main(argv: list[str]) -> int:
         categories=categories,
         start_date=start_date,
         end_date=end_date,
+        date_field=args.date_field,
         max_candidates=args.max_candidates,
         page_size=args.page_size,
     )
-    ranked = rank_candidates(seeds, candidates, min_score=args.min_score, top_n=args.top_n)
-    write_report(output, seeds, ranked, categories, start_date, end_date, args)
-    print(f"Wrote {output} with {len(ranked)} related paper(s).", file=sys.stderr)
+    seed_arxiv_ids = {paper.arxiv_id for paper in seeds}
+    candidates = [paper for paper in candidates if paper.arxiv_id not in seed_arxiv_ids]
+    if not candidates:
+        raise SystemExit("No recent candidate papers found after excluding seed papers.")
+
+    write_markdown_packet(
+        packet_output,
+        seeds=seeds,
+        candidates=candidates,
+        categories=categories,
+        start_date=start_date,
+        end_date=end_date,
+        date_field=args.date_field,
+        batch_size=args.batch_size,
+        language=args.language,
+    )
+    if json_output:
+        write_json_packet(
+            json_output,
+            seeds=seeds,
+            candidates=candidates,
+            categories=categories,
+            start_date=start_date,
+            end_date=end_date,
+            date_field=args.date_field,
+        )
+    print(f"Wrote {packet_output} with {len(candidates)} candidate paper(s).", file=sys.stderr)
+    if json_output:
+        print(f"Wrote {json_output}.", file=sys.stderr)
     return 0
 
 
