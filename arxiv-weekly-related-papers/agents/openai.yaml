@@ -1,0 +1,4 @@
+interface:
+  display_name: "arXiv Weekly Related Papers"
+  short_description: "Weekly related arXiv paper reports"
+  default_prompt: "Use $arxiv-weekly-related-papers to find recent arXiv papers related to these IDs and write a Markdown report."
