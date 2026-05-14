@@ -10,6 +10,7 @@ import json
 import re
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -20,6 +21,8 @@ from typing import Any
 
 ARXIV_API_URL = "https://export.arxiv.org/api/query"
 DEFAULT_CATEGORIES = ("hep-ex", "nucl-ex", "hep-ph", "nucl-th")
+DEFAULT_CONFIG_DIR = Path("~/.arxiv-weekly-related-papers").expanduser()
+DEFAULT_CONFIG_FILENAMES = ("config.json", "arxiv_weekly_config.json")
 ATOM = "{http://www.w3.org/2005/Atom}"
 ARXIV = "{http://arxiv.org/schemas/atom}"
 
@@ -67,14 +70,94 @@ def parse_ymd(value: str) -> dt.date:
         raise argparse.ArgumentTypeError(f"Invalid date '{value}', expected YYYY-MM-DD") from exc
 
 
+def default_config_candidates() -> list[Path]:
+    return [DEFAULT_CONFIG_DIR / filename for filename in DEFAULT_CONFIG_FILENAMES]
+
+
+def find_config_path(explicit_path: Path | None) -> Path | None:
+    if explicit_path is not None:
+        return explicit_path.expanduser()
+    for path in default_config_candidates():
+        if path.exists():
+            return path
+    return None
+
+
+def load_config(path: Path | None) -> tuple[dict[str, Any], Path | None]:
+    resolved_path = find_config_path(path)
+    if resolved_path is None:
+        return {}, None
+    try:
+        data = json.loads(resolved_path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise SystemExit(f"Config file not found: {resolved_path}") from exc
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"Invalid JSON config file {resolved_path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise SystemExit(f"Config file must contain a JSON object: {resolved_path}")
+    return data, resolved_path
+
+
+def config_value(config: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in config:
+            return config[key]
+    return None
+
+
+def categories_from_value(value: Any, *, option_name: str) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return split_csv_or_space([value])
+    if isinstance(value, list):
+        categories: list[str] = []
+        for item in value:
+            if not isinstance(item, str):
+                raise SystemExit(f"{option_name} must contain only category strings.")
+            categories.extend(split_csv_or_space([item]))
+        return categories
+    raise SystemExit(f"{option_name} must be a comma-separated string or a list of strings.")
+
+
+def resolve_categories(cli_value: str | None, config: dict[str, Any]) -> list[str]:
+    if cli_value is not None:
+        categories = categories_from_value(cli_value, option_name="--categories")
+    else:
+        categories = categories_from_value(
+            config_value(config, "categories", "focus_categories", "include_categories"),
+            option_name="config categories",
+        )
+    return categories or list(DEFAULT_CATEGORIES)
+
+
+def resolve_exclude_categories(cli_value: str | None, config: dict[str, Any]) -> list[str]:
+    if cli_value is not None:
+        return categories_from_value(cli_value, option_name="--exclude-categories")
+    return categories_from_value(
+        config_value(config, "exclude_categories", "excluded_categories"),
+        option_name="config exclude_categories",
+    )
+
+
 def arxiv_api_get(params: dict[str, str | int]) -> ET.Element:
     query = urllib.parse.urlencode(params)
     request = urllib.request.Request(
         f"{ARXIV_API_URL}?{query}",
         headers={"User-Agent": "codex-arxiv-weekly-related-papers/3.0"},
     )
-    with urllib.request.urlopen(request, timeout=45) as response:
-        payload = response.read()
+    for attempt in range(4):
+        try:
+            with urllib.request.urlopen(request, timeout=45) as response:
+                payload = response.read()
+            break
+        except urllib.error.HTTPError as exc:
+            if exc.code not in {429, 503} or attempt == 3:
+                raise
+            retry_after = exc.headers.get("Retry-After")
+            delay = int(retry_after) if retry_after and retry_after.isdigit() else 5 * (attempt + 1)
+            print(f"arXiv API returned HTTP {exc.code}; retrying in {delay}s...", file=sys.stderr)
+            time.sleep(delay)
     return ET.fromstring(payload)
 
 
@@ -221,25 +304,58 @@ def paper_as_jsonable(paper: Paper) -> dict[str, Any]:
     return data
 
 
+def excluded_category_hits(paper: Paper, exclude_categories: set[str]) -> list[str]:
+    if not exclude_categories:
+        return []
+    return sorted(set(paper.categories) & exclude_categories)
+
+
+def filter_excluded_categories(
+    candidates: list[Paper],
+    exclude_categories: list[str],
+) -> tuple[list[Paper], int, dict[str, int]]:
+    exclude_set = set(exclude_categories)
+    kept: list[Paper] = []
+    excluded_paper_count = 0
+    excluded_counts: dict[str, int] = {}
+    for paper in candidates:
+        hits = excluded_category_hits(paper, exclude_set)
+        if hits:
+            excluded_paper_count += 1
+            for category in hits:
+                excluded_counts[category] = excluded_counts.get(category, 0) + 1
+            continue
+        kept.append(paper)
+    return kept, excluded_paper_count, dict(sorted(excluded_counts.items()))
+
+
 def write_json_packet(
     output: Path,
     *,
     seeds: list[Paper],
     candidates: list[Paper],
     categories: list[str],
+    exclude_categories: list[str],
+    excluded_paper_count: int,
+    excluded_counts: dict[str, int],
+    config_path: Path | None,
     start_date: dt.date,
     end_date: dt.date,
     date_field: str,
 ) -> None:
     payload = {
         "generated_utc": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "config_path": str(config_path) if config_path else None,
         "date_field": date_field,
         "date_range": {
             "start": start_date.isoformat(),
             "end": end_date.isoformat(),
             "timezone": "UTC",
         },
-        "categories": categories,
+        "focus_categories": categories,
+        "exclude_categories": exclude_categories,
+        "excluded_candidate_count": excluded_paper_count,
+        "excluded_counts_by_category": excluded_counts,
         "seed_papers": [paper_as_jsonable(paper) for paper in seeds],
         "candidate_papers": [paper_as_jsonable(paper) for paper in candidates],
         "analysis_schema": {
@@ -258,6 +374,10 @@ def write_markdown_packet(
     seeds: list[Paper],
     candidates: list[Paper],
     categories: list[str],
+    exclude_categories: list[str],
+    excluded_paper_count: int,
+    excluded_counts: dict[str, int],
+    config_path: Path | None,
     start_date: dt.date,
     end_date: dt.date,
     date_field: str,
@@ -287,11 +407,14 @@ def write_markdown_packet(
         "## Query",
         "",
         f"- Generated: {generated}",
+        f"- Config: {config_path if config_path else 'none'}",
         f"- Date field: {date_field}",
         f"- Date range: {start_date.isoformat()} to {end_date.isoformat()} (UTC, inclusive)",
-        f"- Categories: {', '.join(categories)}",
+        f"- Focus categories: {', '.join(categories)}",
+        f"- Exclude categories: {', '.join(exclude_categories) if exclude_categories else 'none'}",
         f"- Seed IDs: {', '.join(paper.arxiv_id for paper in seeds)}",
         f"- Candidate count: {len(candidates)}",
+        f"- Excluded before AI analysis: {excluded_paper_count}",
         "",
         "## Required AI Output Fields",
         "",
@@ -302,9 +425,14 @@ def write_markdown_packet(
         "- `recommendation_reason`: why the group should or should not track it",
         "- `research_ideas`: concrete extension ideas or ways to combine with the seed-paper research",
         "",
-        "## Seed Papers",
-        "",
     ]
+    if excluded_counts:
+        lines.extend(["## Excluded Category Hits", ""])
+        for category, count in excluded_counts.items():
+            lines.append(f"- {category}: {count}")
+        lines.extend(["", "Excluded papers are intentionally omitted from this packet to save model context.", ""])
+
+    lines.extend(["## Seed Papers", ""])
 
     for paper in seeds:
         lines.extend(
@@ -323,6 +451,8 @@ def write_markdown_packet(
         )
 
     lines.extend(["## Candidate Papers", ""])
+    if not candidates:
+        lines.extend(["No candidate papers remain after seed-paper and excluded-category filtering.", ""])
     for batch_index, batch in enumerate(chunked(candidates, batch_size), 1):
         lines.extend([f"### Batch {batch_index}", ""])
         for paper in batch:
@@ -352,13 +482,26 @@ def write_markdown_packet(
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--config",
+        type=Path,
+        help=(
+            "Optional JSON config file for focus and exclude categories. "
+            "When omitted, the script checks ~/.arxiv-weekly-related-papers/config.json "
+            "then ~/.arxiv-weekly-related-papers/arxiv_weekly_config.json."
+        ),
+    )
     parser.add_argument("--ids", nargs="+", required=True, help="Seed arXiv IDs, comma-separated or space-separated.")
     parser.add_argument("--packet-output", type=Path, help="Markdown packet path for the executing AI agent to read.")
     parser.add_argument("--json-output", type=Path, help="Optional JSON packet path with the same papers and metadata.")
     parser.add_argument("--days", type=int, default=7, help="Lookback window in UTC days when explicit dates are absent.")
     parser.add_argument("--start-date", type=parse_ymd, help="Inclusive UTC start date, YYYY-MM-DD.")
     parser.add_argument("--end-date", type=parse_ymd, help="Inclusive UTC end date, YYYY-MM-DD.")
-    parser.add_argument("--categories", default=",".join(DEFAULT_CATEGORIES), help="Comma-separated arXiv categories.")
+    parser.add_argument("--categories", help="Comma-separated arXiv focus categories. Overrides config categories.")
+    parser.add_argument(
+        "--exclude-categories",
+        help="Comma-separated arXiv categories to drop before packet generation. Overrides config exclude_categories.",
+    )
     parser.add_argument(
         "--date-field",
         choices=("lastUpdatedDate", "submittedDate"),
@@ -374,10 +517,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
+    config, config_path = load_config(args.config)
     seed_ids = split_csv_or_space(args.ids)
     if not seed_ids:
         raise SystemExit("At least one seed arXiv ID is required.")
-    categories = split_csv_or_space([args.categories])
+    categories = resolve_categories(args.categories, config)
+    exclude_categories = resolve_exclude_categories(args.exclude_categories, config)
     if not categories:
         raise SystemExit("At least one arXiv category is required.")
     if args.days <= 0:
@@ -417,14 +562,17 @@ def main(argv: list[str]) -> int:
     )
     seed_arxiv_ids = {paper.arxiv_id for paper in seeds}
     candidates = [paper for paper in candidates if paper.arxiv_id not in seed_arxiv_ids]
-    if not candidates:
-        raise SystemExit("No recent candidate papers found after excluding seed papers.")
+    candidates, excluded_paper_count, excluded_counts = filter_excluded_categories(candidates, exclude_categories)
 
     write_markdown_packet(
         packet_output,
         seeds=seeds,
         candidates=candidates,
         categories=categories,
+        exclude_categories=exclude_categories,
+        excluded_paper_count=excluded_paper_count,
+        excluded_counts=excluded_counts,
+        config_path=config_path,
         start_date=start_date,
         end_date=end_date,
         date_field=args.date_field,
@@ -437,11 +585,17 @@ def main(argv: list[str]) -> int:
             seeds=seeds,
             candidates=candidates,
             categories=categories,
+            exclude_categories=exclude_categories,
+            excluded_paper_count=excluded_paper_count,
+            excluded_counts=excluded_counts,
+            config_path=config_path,
             start_date=start_date,
             end_date=end_date,
             date_field=args.date_field,
         )
     print(f"Wrote {packet_output} with {len(candidates)} candidate paper(s).", file=sys.stderr)
+    if excluded_paper_count:
+        print(f"Excluded {excluded_paper_count} candidate paper(s) by category.", file=sys.stderr)
     if json_output:
         print(f"Wrote {json_output}.", file=sys.stderr)
     return 0
