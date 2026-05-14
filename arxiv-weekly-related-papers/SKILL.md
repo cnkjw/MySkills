@@ -90,8 +90,12 @@ Use this Markdown structure for the final report:
      - `- **推荐度评分**：<recommendation_score>/100`
      - `- **关系类型**：<relation_type>`
    - Do not use English labels like `Authors`, `Categories`, `Published/Updated`, `Relevance score`, or inline semicolon-separated metadata.
+   - Before `相关理由`, include two abstract paragraphs in this exact order:
+     - `**Abstract:** <original summary from arxiv_packet.md/json>`
+     - `**摘要：** <AI Chinese translation of the Abstract>`
    - Then include three bold paragraphs: `相关理由`, `推荐理由`, and `拓展研究思路`.
    - Use bullets for research ideas. Keep them concrete and actionable.
+   - Preserve LaTeX math delimiters from arXiv text. Keep inline math as `$...$` and display math as `$$...$$`; never wrap LaTeX formulas in backticks because that prevents Markdown math rendering.
 5. `## 候选论文完整列表（精简版）`
    - Use a compact table with `#`, `arXiv ID`, `标题（简）`, `类别`, `相关度`, `推荐度`, and `关系`.
    - Include all selected and borderline papers worth tracking.
