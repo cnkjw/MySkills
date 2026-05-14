@@ -364,6 +364,15 @@ def write_json_packet(
             "relation_type": "direct | method | background | contrast | weak | not_related",
             "research_ideas": "Concrete follow-up directions or ways to connect the candidate paper with the seed-paper research",
         },
+        "preferred_final_report_format": [
+            "Title: arXiv weekly report mentioning seed count or main seed topic",
+            "Query parameters: use bold Chinese labels in this exact order: 生成时间, 日期范围, 日期字段, 关注类别, 排除类别, 候选论文总数, AI 分析前排除; fill values dynamically from this packet; use Chinese full-width colon",
+            "Seed paper overview: group seed papers into research subdirections and summarize their core content/methods in tables",
+            "AI-selected papers: group by relation type in this order: direct, method, background, weak",
+            "Selected paper entries: include title, then Chinese metadata bullets for 作者, 类别, 发表/更新, 相关度评分, 推荐度评分, 关系类型, followed by relevance reason, recommendation reason, and research ideas",
+            "Compact candidate table: include only evaluated papers worth listing, with arXiv ID, short title, categories, relevance score, recommendation score, and relation",
+            "Methodology note: state that arXiv API fetched candidates and the executing AI assistant evaluated titles, abstracts, categories, and metadata",
+        ],
     }
     output.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -391,6 +400,13 @@ def write_markdown_packet(
             "执行该 skill 的 Codex/opencode/Claude Code 应读取本文件，基于种子论文摘要分析每篇候选论文。"
             "不要使用本地关键词/分类/作者重合打分；用当前模型判断相关程度、推荐程度，并为值得关注的论文给出拓展研究思路。"
         )
+        meta_labels = {
+            "authors": "作者",
+            "categories": "类别",
+            "published": "发表",
+            "updated": "更新",
+            "pdf": "PDF",
+        }
     else:
         title = "arXiv Candidate Packet for AI Analysis"
         instruction = (
@@ -398,6 +414,13 @@ def write_markdown_packet(
             "against the seed-paper abstracts. Do not use local keyword/category/author-overlap scoring; use the current "
             "model to judge relevance, recommendation strength, and extension ideas for useful papers."
         )
+        meta_labels = {
+            "authors": "Authors",
+            "categories": "Categories",
+            "published": "Published",
+            "updated": "Updated",
+            "pdf": "PDF",
+        }
 
     lines = [
         f"# {title}",
@@ -425,6 +448,25 @@ def write_markdown_packet(
         "- `recommendation_reason`: why the group should or should not track it",
         "- `research_ideas`: concrete extension ideas or ways to combine with the seed-paper research",
         "",
+        "## Preferred Final Report Format",
+        "",
+        "Use this structure for the final Markdown report unless the user asks for another style:",
+        "",
+        "1. `# arXiv 周报：<种子数量或核心主题>相关候选分析`",
+        "2. `## 查询参数`: use exactly this field order and label style. Fill values dynamically from this packet; do not copy placeholder values:",
+        "   - `- **生成时间**：<generated time>`",
+        "   - `- **日期范围**：<start date> 至 <end date>（UTC，含端点）`",
+        "   - `- **日期字段**：<date_field>`",
+        "   - `- **关注类别**：<focus categories joined by \", \">`",
+        "   - `- **排除类别**：<exclude categories joined by \", \" or \"无\">`",
+        "   - `- **候选论文总数**：<candidate paper count>`",
+        "   - `- **AI 分析前排除**：<excluded candidate count>`",
+        "3. `## 种子论文概览`: group seed papers into 2-4 research subdirections; use compact tables with arXiv ID, core content, and method.",
+        "4. `## AI 精选论文`: group selected papers by relation type in this order: `direct`, `method`, `background`, `weak`.",
+        "5. For every selected paper, use a numbered `####` heading. Under it, use exactly these Chinese metadata bullets: `- **作者**：...`, `- **类别**：...`, `- **发表/更新**：...`, `- **相关度评分**：.../100`, `- **推荐度评分**：.../100`, `- **关系类型**：...`. Do not use English metadata labels or semicolon-separated inline metadata. Then include relevance reason, recommendation reason, and concrete research ideas.",
+        "6. `## 候选论文完整列表（精简版）`: use a compact table with arXiv ID, short title, categories, relevance score, recommendation score, and relation. Do not dump hundreds of unrelated rows; summarize the remaining non-relevant papers in one sentence.",
+        "7. `## 方法论注记`: state that candidates came from arXiv API and were evaluated by the executing AI assistant from titles, abstracts, categories, and metadata. Do not claim exhaustive citation coverage.",
+        "",
     ]
     if excluded_counts:
         lines.extend(["## Excluded Category Hits", ""])
@@ -439,11 +481,11 @@ def write_markdown_packet(
             [
                 f"### [{paper.arxiv_id}]({paper.abs_url}) {paper.title}",
                 "",
-                f"- Authors: {short_authors(paper.authors)}",
-                f"- Categories: {', '.join(paper.categories)}",
-                f"- Published: {paper.published[:10]}",
-                f"- Updated: {paper.updated[:10]}",
-                f"- PDF: {paper.pdf_url}",
+                f"- {meta_labels['authors']}: {short_authors(paper.authors)}",
+                f"- {meta_labels['categories']}: {', '.join(paper.categories)}",
+                f"- {meta_labels['published']}: {paper.published[:10]}",
+                f"- {meta_labels['updated']}: {paper.updated[:10]}",
+                f"- {meta_labels['pdf']}: {paper.pdf_url}",
                 "",
                 paper.summary,
                 "",
@@ -460,11 +502,11 @@ def write_markdown_packet(
                 [
                     f"#### [{paper.arxiv_id}]({paper.abs_url}) {paper.title}",
                     "",
-                    f"- Authors: {short_authors(paper.authors)}",
-                    f"- Categories: {', '.join(paper.categories)}",
-                    f"- Published: {paper.published[:10]}",
-                    f"- Updated: {paper.updated[:10]}",
-                    f"- PDF: {paper.pdf_url}",
+                    f"- {meta_labels['authors']}: {short_authors(paper.authors)}",
+                    f"- {meta_labels['categories']}: {', '.join(paper.categories)}",
+                    f"- {meta_labels['published']}: {paper.published[:10]}",
+                    f"- {meta_labels['updated']}: {paper.updated[:10]}",
+                    f"- {meta_labels['pdf']}: {paper.pdf_url}",
                     "",
                     paper.summary,
                     "",
