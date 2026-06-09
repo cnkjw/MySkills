@@ -1,0 +1,4 @@
+interface:
+  display_name: "HEPData Fetch"
+  short_description: "Search and download HEPData records"
+  default_prompt: "Use $hepdata-fetch to find and download HEPData tables for this query."
